@@ -3,4 +3,5 @@ opencv-python-headless
 mediapipe
 matplotlib
 numpy
+fpdf2
 reportlab  # only if you later add PDF report
