@@ -5,195 +5,267 @@
 # ============================================================
 
 import streamlit as st
-import cv2, os, zipfile, tempfile, urllib.request, statistics
+import cv2
 import numpy as np
-import matplotlib.pyplot as plt
-from collections import deque
-from fpdf import FPDF
 import mediapipe as mp
-from mediapipe.tasks.python import vision
 from mediapipe.tasks import python
-from datetime import datetime
+from mediapipe.tasks.python import vision
+import os
+import datetime
+import statistics
+from collections import deque
+import pandas as pd
+import matplotlib.pyplot as plt
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+import io
+import tempfile
 
-# ============================================================
-# STREAMLIT CONFIG
-# ============================================================
-st.set_page_config(page_title="Freestyle Swimming Analyzer", layout="wide")
-st.title("🏊 Freestyle Swimming Technique Analyzer")
+# =============================================
+# HELPER FUNCTIONS (same as your Colab version)
+# =============================================
 
-# ============================================================
-# COACH SETTINGS
-# ============================================================
-st.sidebar.header("Coach Settings")
+def angle(a, b, c):
+    ba = np.array(a) - np.array(b)
+    bc = np.array(c) - np.array(b)
+    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
+    return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
 
-UNDERWATER = st.sidebar.toggle("Underwater footage", False)
-STRICT = st.sidebar.toggle("Strict scoring", False)
-SHOW_PREVIEW = st.sidebar.toggle("Show preview frames", False)
-FRAME_SKIP = st.sidebar.slider("Frame skip (mobile)", 0, 3, 1)
-SMOOTH = st.sidebar.slider("Angle smoothing", 3, 15, 7)
+def deviation(val, ideal_range):
+    lo, hi = ideal_range
+    if val < lo: return lo - val
+    if val > hi: return val - hi
+    return 0.0
 
-PENALTY_MULT = 1.3 if STRICT else 1.0
-IDEAL_ELBOW = (70,120) if UNDERWATER else (80,140)
-IDEAL_KNEE  = (150,175)
+def local_min_center(window, prom=10.0):
+    if len(window) < 3: return False, None
+    center = len(window) // 2
+    val = window[center]
+    left_ok = all(val <= window[i] + prom for i in range(center))
+    right_ok = all(val <= window[i] + prom for i in range(center, len(window)))
+    return left_ok and right_ok, val
 
-# ============================================================
-# HELPERS
-# ============================================================
-def angle(a,b,c):
-    ba, bc = np.array(a)-np.array(b), np.array(c)-np.array(b)
-    cos = np.dot(ba,bc)/(np.linalg.norm(ba)*np.linalg.norm(bc)+1e-6)
-    return np.degrees(np.arccos(np.clip(cos,-1,1)))
+def signed_yaw_proxy(nose, left_shoulder, right_shoulder):
+    if right_shoulder[0] == left_shoulder[0]: return 0.0
+    dx = right_shoulder[0] - left_shoulder[0]
+    expected_nose_x = left_shoulder[0] + dx * 0.5
+    return (nose[0] - expected_nose_x) / (abs(dx) + 1e-6)
 
-def deviation(v,r):
-    return max(r[0]-v,0)+max(v-r[1],0)
+def shoulder_roll_angle(ls, rs):
+    dy = ls[1] - rs[1]
+    dx = ls[0] - rs[0]
+    if dx == 0: return 90.0 if dy > 0 else -90.0
+    return np.degrees(np.arctan2(dy, dx))
 
-# ============================================================
-# MEDIAPIPE TASKS MODEL
-# ============================================================
-MODEL = "pose_landmarker_heavy.task"
-if not os.path.exists(MODEL):
-    urllib.request.urlretrieve(
-        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
-        MODEL
-    )
+# =============================================
+# STREAMLIT APP
+# =============================================
 
-options = vision.PoseLandmarkerOptions(
-    base_options=python.BaseOptions(model_asset_path=MODEL),
-    running_mode=vision.RunningMode.VIDEO,
-    num_poses=1
-)
-detector = vision.PoseLandmarker.create_from_options(options)
+st.set_page_config(page_title="Freestyle Swim Coach Analyzer", layout="wide")
 
-# ============================================================
-# FILE UPLOAD
-# ============================================================
-videos = st.file_uploader(
-    "Upload freestyle swimming videos",
-    type=["mp4","mov","avi"],
-    accept_multiple_files=True
-)
+st.title("Freestyle Swimming Technique Analyzer")
+st.markdown("Upload a side-view freestyle swimming video to get an **annotated video**, data export (CSV), and detailed **PDF report** with key positions and time-series plot.")
 
-if not videos:
-    st.stop()
+# Configuration sidebar
+with st.sidebar:
+    st.header("Settings")
+    is_underwater = st.checkbox("Underwater footage", value=False)
+    preview_every = st.slider("Preview every N frames (0 = disable)", 0, 120, 30)
 
-results_summary = []
-temp_dir = tempfile.mkdtemp()
-zip_path = os.path.join(temp_dir, "swim_results.zip")
-zipf = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED)
+# Upload video
+uploaded_file = st.file_uploader("Upload freestyle video (.mp4 recommended)", type=["mp4", "mov", "avi"])
 
-# ============================================================
-# PROCESS VIDEOS
-# ============================================================
-for video in videos:
-    st.subheader(video.name)
-    video_path = os.path.join(temp_dir, video.name)
-    with open(video_path,"wb") as f:
-        f.write(video.read())
+if uploaded_file is not None:
+    st.success("Video uploaded successfully!")
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    w,h = int(cap.get(3)), int(cap.get(4))
+    if st.button("Analyze Video", type="primary"):
+        with st.spinner("Processing video... This may take a few minutes depending on length."):
+            # Create temp directory for outputs
+            with tempfile.TemporaryDirectory() as tmpdir:
+                input_path = os.path.join(tmpdir, "input.mp4")
+                with open(input_path, "wb") as f:
+                    f.write(uploaded_file.read())
 
-    elbow_buf = deque(maxlen=SMOOTH)
-    scores, sym = [], []
-    frame_id = 0
+                # ------------------------------------------------
+                #  MODEL SETUP
+                # ------------------------------------------------
+                MODEL = "pose_landmarker_heavy.task"
+                if not os.path.exists(MODEL):
+                    st.info("Downloading pose model...")
+                    urllib.request.urlretrieve(
+                        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+                        MODEL
+                    )
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_id += 1
-        if frame_id % (FRAME_SKIP+1) != 0:
-            continue
+                base = python.BaseOptions(model_asset_path=MODEL)
+                options = vision.PoseLandmarkerOptions(
+                    base_options=base,
+                    running_mode=vision.RunningMode.VIDEO,
+                    num_poses=1,
+                    min_pose_detection_confidence=0.6,
+                    min_pose_presence_confidence=0.6,
+                    min_tracking_confidence=0.6
+                )
+                detector = vision.PoseLandmarker.create_from_options(options)
 
-        try:
-            mp_img = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            )
-            res = detector.detect_for_video(mp_img, int(frame_id/fps*1000))
-            if not res.pose_landmarks:
-                continue
+                # ------------------------------------------------
+                #  VIDEO PROCESSING
+                # ------------------------------------------------
+                cap = cv2.VideoCapture(input_path)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            lm = res.pose_landmarks[0]
-            P = lambda i: (int(lm[i].x*w), int(lm[i].y*h))
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                annotated_path = os.path.join(tmpdir, f"annotated_{timestamp}.mp4")
+                writer = cv2.VideoWriter(annotated_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
-            LS,LE,LW = P(11),P(13),P(15)
-            LH,LK,LA = P(23),P(25),P(27)
-            RH,RK,RA = P(24),P(26),P(28)
+                # Data lists
+                times, elbow_vals, kl_vals, kr_vals = [], [], [], []
+                sym_vals, scores, yaw_series, breath_state_series, roll_angles = [], [], [], [], []
 
-            elbow = angle(LS,LE,LW)
-            kneeL = angle(LH,LK,LA)
-            kneeR = angle(RH,RK,RA)
+                elbow_buf = deque(maxlen=7)
+                kl_buf = deque(maxlen=7)
+                kr_buf = deque(maxlen=7)
 
-            elbow_buf.append(elbow)
-            elbow_s = statistics.mean(elbow_buf)
+                elbow_win = deque(maxlen=9)
+                time_win = deque(maxlen=9)
+                stroke_times = []
 
-            penalty = (
-                deviation(elbow_s,IDEAL_ELBOW)*0.4 +
-                abs(kneeL-kneeR)*0.4 +
-                (deviation(kneeL,IDEAL_KNEE)+deviation(kneeR,IDEAL_KNEE))*0.2
-            ) * PENALTY_MULT
+                last_breath_time = -1e9
+                breath_count_L = breath_count_R = 0
+                current_side = 'N'
+                side_persist_counter = 0
 
-            score = max(0,100-penalty)
-            scores.append(score)
-            sym.append(abs(kneeL-kneeR))
+                best_elbow_dev = float('inf')
+                worst_elbow_dev = -float('inf')
+                best_frame_bytes = worst_frame_bytes = None
+                best_time = worst_time = None
 
-            if SHOW_PREVIEW and frame_id % 90 == 0:
-                st.image(frame, channels="BGR")
+                frame_id = 0
 
-        except Exception:
-            continue   # ✅ graceful MediaPipe failure recovery
+                IDEAL_ELBOW = (100, 135)
+                IDEAL_KNEE = (120, 160) if is_underwater else (125, 165)
 
-    cap.release()
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-    avg_score = round(statistics.mean(scores),1) if scores else 0
-    avg_sym = round(statistics.mean(sym),1) if sym else 0
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret: break
 
-    results_summary.append((video.name, avg_score, avg_sym))
+                    frame_id += 1
+                    progress_bar.progress(min(frame_id / 500, 1.0))  # rough estimate
+                    status_text.text(f"Processing frame {frame_id}...")
 
-    # ------------------ CHART ------------------
-    fig, ax = plt.subplots()
-    ax.plot(scores, label="Score")
-    ax.plot(sym, label="Symmetry")
-    ax.legend()
-    chart_path = f"{video.name}_chart.png"
-    fig.savefig(chart_path)
-    plt.close(fig)
-    zipf.write(chart_path)
+                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                      data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    result = detector.detect_for_video(mp_img, int(frame_id * 1000 / fps))
 
-    # ------------------ PDF ------------------
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial","B",14)
-    pdf.cell(0,10,video.name,ln=1)
-    pdf.set_font("Arial","",11)
-    pdf.cell(0,8,f"Average Score: {avg_score}",ln=1)
-    pdf.cell(0,8,f"Average Symmetry: {avg_sym}",ln=1)
-    pdf.image(chart_path,w=170)
+                    if not result.pose_landmarks:
+                        writer.write(frame)
+                        continue
 
-    pdf_path = f"{video.name}.pdf"
-    pdf.output(pdf_path)
-    zipf.write(pdf_path)
+                    lm = result.pose_landmarks[0]
+                    P = lambda i: (int(lm[i].x * width), int(lm[i].y * height))
 
-# ============================================================
-# COACH COMPARISON TABLE
-# ============================================================
-st.subheader("📊 Coach Comparison")
-st.table(
-    [{"Video":v,"Avg Score":s,"Symmetry":y} for v,s,y in results_summary]
-)
+                    LS, RS = P(11), P(12)
+                    LE, LW = P(13), P(15)
+                    LH, LK, LA = P(23), P(25), P(27)
+                    RH, RK, RA = P(24), P(26), P(28)
+                    NZ = P(0)
 
-zipf.close()
+                    elbow = angle(LS, LE, LW)
+                    kl = angle(LH, LK, LA)
+                    kr = angle(RH, RK, RA)
 
-# ============================================================
-# DOWNLOAD
-# ============================================================
-with open(zip_path,"rb") as f:
-    st.download_button(
-        "⬇ Download ALL Results (ZIP)",
-        data=f,
-        file_name="swim_analysis_results.zip",
-        mime="application/zip"
-    )
+                    elbow_buf.append(elbow)
+                    kl_buf.append(kl)
+                    kr_buf.append(kr)
 
+                    elbow_s = statistics.mean(elbow_buf)
+                    kl_s = statistics.mean(kl_buf)
+                    kr_s = statistics.mean(kr_buf)
+
+                    roll = shoulder_roll_angle(LS, RS)
+
+                    e_dev = deviation(elbow_s, IDEAL_ELBOW)
+                    kl_dev = deviation(kl_s, IDEAL_KNEE)
+                    kr_dev = deviation(kr_s, IDEAL_KNEE)
+                    symmetry = abs(kl_s - kr_s)
+
+                    raw_penalty = e_dev * 0.4 + symmetry * 0.3 + abs(kl_dev - kr_dev) * 0.3
+                    score = max(0, min(100, 100 - raw_penalty))
+
+                    times.append(frame_id / fps)
+                    elbow_vals.append(elbow_s)
+                    kl_vals.append(kl_s)
+                    kr_vals.append(kr_s)
+                    sym_vals.append(symmetry)
+                    scores.append(score)
+                    yaw_series.append(signed_yaw_proxy(NZ, LS, RS))
+                    roll_angles.append(roll)
+
+                    # Phase, stroke, breath logic (copy from your original)
+                    phase = 'Pull' if LW[1] > LS[1] else 'Recovery'
+
+                    # ... (add your stroke and breath detection code here - same as original)
+
+                    # Draw annotations (same as original)
+                    arm_c = (0, 255, 0) if e_dev <= 10 else (0, 255, 255) if e_dev <= 20 else (0, 0, 255)
+                    # ... draw lines, circles, text overlays ...
+
+                    writer.write(frame)
+
+                cap.release()
+                writer.release()
+
+                # ------------------------------------------------
+                #  POST-PROCESSING: CSV, Plot, PDF
+                # ------------------------------------------------
+                # CSV
+                df = pd.DataFrame({
+                    "time_s": times,
+                    "elbow_deg": elbow_vals,
+                    "knee_left_deg": kl_vals,
+                    "knee_right_deg": kr_vals,
+                    "symmetry_deg": sym_vals,
+                    "score": scores,
+                    "yaw_proxy": yaw_series,
+                    "breath_state": breath_state_series,
+                    "body_roll_deg": roll_angles
+                })
+                csv_buffer = io.BytesIO()
+                df.to_csv(csv_buffer, index=False, float_format="%.2f")
+                csv_buffer.seek(0)
+
+                # Plot (generate and save to bytes)
+                fig_buffer = io.BytesIO()
+                # ... your matplotlib plot code here ...
+                # plt.savefig(fig_buffer, format="png", dpi=150, bbox_inches="tight")
+                # fig_buffer.seek(0)
+
+                # PDF (same structure, embed plot and key frames)
+                pdf_buffer = io.BytesIO()
+                pdf = SimpleDocTemplate(pdf_buffer, pagesize=letter)
+                # ... build story with Paragraphs, RLImage(fig_buffer), etc. ...
+                pdf.build(story)
+                pdf_buffer.seek(0)
+
+                st.success("Analysis complete!")
+
+                # Display results
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.video(annotated_path)
+                    with open(annotated_path, "rb") as f:
+                        st.download_button("Download Annotated Video", f, file_name="annotated_swim.mp4")
+
+                with col2:
+                    st.download_button("Download CSV Data", csv_buffer, "swim_analysis.csv", "text/csv")
+                    st.download_button("Download PDF Report", pdf_buffer, "swim_report.pdf", "application/pdf")
+
+else:
+    st.info("Please upload a video to start analysis.")
