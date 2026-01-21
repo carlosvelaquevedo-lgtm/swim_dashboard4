@@ -1,0 +1,6 @@
+streamlit>=1.30.0
+opencv-python-headless
+mediapipe
+matplotlib
+numpy
+reportlab  # only if you later add PDF report
