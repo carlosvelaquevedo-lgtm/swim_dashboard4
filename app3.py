@@ -1,204 +1,199 @@
 # -*- coding: utf-8 -*-
-# =========================================================
-# 🏊 Freestyle Swimming Technique Analyzer — Streamlit App
-# =========================================================
+# ============================================================
+# 🏊 Freestyle Swimming Technique Analyzer – Streamlit App
+# Cloud-safe • Mobile-safe • Coach-ready
+# ============================================================
 
 import streamlit as st
-import cv2
-import mediapipe as mp
+import cv2, os, zipfile, tempfile, urllib.request, statistics
 import numpy as np
-import tempfile
-import zipfile
-import os
-import io
-import math
-from collections import deque, defaultdict
 import matplotlib.pyplot as plt
+from collections import deque
 from fpdf import FPDF
+import mediapipe as mp
+from mediapipe.tasks.python import vision
+from mediapipe.tasks import python
+from datetime import datetime
 
-# ---------------- CONFIG ----------------
-st.set_page_config(layout="wide")
-mp_pose = mp.solutions.pose
-
-# ---------------- UTILS ----------------
-def angle(a, b, c):
-    ba = a - b
-    bc = c - b
-    cosang = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
-    return np.degrees(np.arccos(np.clip(cosang, -1, 1)))
-
-def safe_get(lm, idx):
-    return np.array([lm[idx].x, lm[idx].y])
-
-# ---------------- PDF ----------------
-class Report(FPDF):
-    def header(self):
-        self.set_font("Arial", "B", 14)
-        self.cell(0, 10, "Freestyle Technique Report", ln=True)
-
-def generate_pdf(name, strokes, score):
-    pdf = Report()
-    pdf.add_page()
-    pdf.set_font("Arial", size=11)
-    pdf.cell(0, 8, f"Athlete / Video: {name}", ln=True)
-    pdf.cell(0, 8, f"Technique Score: {score:.1f}/100", ln=True)
-    pdf.ln(4)
-
-    for i, s in enumerate(strokes, 1):
-        pdf.cell(0, 7, f"Stroke {i}", ln=True)
-        pdf.cell(0, 7, f"  Avg Elbow: {s['elbow']:.1f}°", ln=True)
-        pdf.cell(0, 7, f"  Avg Knee: {s['knee']:.1f}°", ln=True)
-        pdf.cell(0, 7, f"  Symmetry Error: {s['sym']:.3f}", ln=True)
-        pdf.ln(2)
-
-    out = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    pdf.output(out.name)
-    return out.name
-
-# ---------------- STREAMLIT UI ----------------
+# ============================================================
+# STREAMLIT CONFIG
+# ============================================================
+st.set_page_config(page_title="Freestyle Swimming Analyzer", layout="wide")
 st.title("🏊 Freestyle Swimming Technique Analyzer")
 
-uploaded = st.file_uploader(
+# ============================================================
+# COACH SETTINGS
+# ============================================================
+st.sidebar.header("Coach Settings")
+
+UNDERWATER = st.sidebar.toggle("Underwater footage", False)
+STRICT = st.sidebar.toggle("Strict scoring", False)
+SHOW_PREVIEW = st.sidebar.toggle("Show preview frames", False)
+FRAME_SKIP = st.sidebar.slider("Frame skip (mobile)", 0, 3, 1)
+SMOOTH = st.sidebar.slider("Angle smoothing", 3, 15, 7)
+
+PENALTY_MULT = 1.3 if STRICT else 1.0
+IDEAL_ELBOW = (70,120) if UNDERWATER else (80,140)
+IDEAL_KNEE  = (150,175)
+
+# ============================================================
+# HELPERS
+# ============================================================
+def angle(a,b,c):
+    ba, bc = np.array(a)-np.array(b), np.array(c)-np.array(b)
+    cos = np.dot(ba,bc)/(np.linalg.norm(ba)*np.linalg.norm(bc)+1e-6)
+    return np.degrees(np.arccos(np.clip(cos,-1,1)))
+
+def deviation(v,r):
+    return max(r[0]-v,0)+max(v-r[1],0)
+
+# ============================================================
+# MEDIAPIPE TASKS MODEL
+# ============================================================
+MODEL = "pose_landmarker_heavy.task"
+if not os.path.exists(MODEL):
+    urllib.request.urlretrieve(
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+        MODEL
+    )
+
+options = vision.PoseLandmarkerOptions(
+    base_options=python.BaseOptions(model_asset_path=MODEL),
+    running_mode=vision.RunningMode.VIDEO,
+    num_poses=1
+)
+detector = vision.PoseLandmarker.create_from_options(options)
+
+# ============================================================
+# FILE UPLOAD
+# ============================================================
+videos = st.file_uploader(
     "Upload freestyle swimming videos",
-    type=["mp4", "mov", "avi"],
+    type=["mp4","mov","avi"],
     accept_multiple_files=True
 )
 
-with st.sidebar:
-    st.header("Coach Settings")
-    underwater = st.toggle("Underwater footage")
-    strict = st.toggle("Strict scoring")
-    preview = st.toggle("Show preview frames")
-    frame_skip = st.slider("Frame skip (mobile)", 0, 3, 1)
-    smooth_win = st.slider("Angle smoothing", 3, 15, 7)
+if not videos:
+    st.stop()
 
-# ---------------- PROCESS ----------------
-results = []
-zip_files = []
+results_summary = []
+temp_dir = tempfile.mkdtemp()
+zip_path = os.path.join(temp_dir, "swim_results.zip")
+zipf = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED)
 
-if uploaded:
-    for file in uploaded:
-        st.subheader(file.name)
-        tmp = tempfile.NamedTemporaryFile(delete=False)
-        tmp.write(file.read())
-        cap = cv2.VideoCapture(tmp.name)
+# ============================================================
+# PROCESS VIDEOS
+# ============================================================
+for video in videos:
+    st.subheader(video.name)
+    video_path = os.path.join(temp_dir, video.name)
+    with open(video_path,"wb") as f:
+        f.write(video.read())
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps < 10 or fps > 120:
-            fps = 30
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    w,h = int(cap.get(3)), int(cap.get(4))
 
-        pose = mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+    elbow_buf = deque(maxlen=SMOOTH)
+    scores, sym = [], []
+    frame_id = 0
 
-        elbows, knees, sym = [], [], []
-        elbow_q = deque(maxlen=smooth_win)
-        knee_q = deque(maxlen=smooth_win)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_id += 1
+        if frame_id % (FRAME_SKIP+1) != 0:
+            continue
 
-        timestamp = 0
-        frame_id = 0
-        stroke_bins = defaultdict(list)
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_id += 1
-            if frame_id % (frame_skip + 1) != 0:
+        try:
+            mp_img = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            )
+            res = detector.detect_for_video(mp_img, int(frame_id/fps*1000))
+            if not res.pose_landmarks:
                 continue
 
-            timestamp += int(1000 / fps)
+            lm = res.pose_landmarks[0]
+            P = lambda i: (int(lm[i].x*w), int(lm[i].y*h))
 
-            try:
-                img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                res = pose.process(img)
-                if not res.pose_landmarks:
-                    continue
+            LS,LE,LW = P(11),P(13),P(15)
+            LH,LK,LA = P(23),P(25),P(27)
+            RH,RK,RA = P(24),P(26),P(28)
 
-                lm = res.pose_landmarks.landmark
+            elbow = angle(LS,LE,LW)
+            kneeL = angle(LH,LK,LA)
+            kneeR = angle(RH,RK,RA)
 
-                sh = safe_get(lm, mp_pose.PoseLandmark.LEFT_SHOULDER.value)
-                el = safe_get(lm, mp_pose.PoseLandmark.LEFT_ELBOW.value)
-                wr = safe_get(lm, mp_pose.PoseLandmark.LEFT_WRIST.value)
+            elbow_buf.append(elbow)
+            elbow_s = statistics.mean(elbow_buf)
 
-                hip = safe_get(lm, mp_pose.PoseLandmark.LEFT_HIP.value)
-                kn = safe_get(lm, mp_pose.PoseLandmark.LEFT_KNEE.value)
-                an = safe_get(lm, mp_pose.PoseLandmark.LEFT_ANKLE.value)
+            penalty = (
+                deviation(elbow_s,IDEAL_ELBOW)*0.4 +
+                abs(kneeL-kneeR)*0.4 +
+                (deviation(kneeL,IDEAL_KNEE)+deviation(kneeR,IDEAL_KNEE))*0.2
+            ) * PENALTY_MULT
 
-                ea = angle(sh, el, wr)
-                ka = angle(hip, kn, an)
+            score = max(0,100-penalty)
+            scores.append(score)
+            sym.append(abs(kneeL-kneeR))
 
-                elbow_q.append(ea)
-                knee_q.append(ka)
+            if SHOW_PREVIEW and frame_id % 90 == 0:
+                st.image(frame, channels="BGR")
 
-                ea_s = np.mean(elbow_q)
-                ka_s = np.mean(knee_q)
+        except Exception:
+            continue   # ✅ graceful MediaPipe failure recovery
 
-                elbows.append(ea_s)
-                knees.append(ka_s)
+    cap.release()
 
-                sym_err = abs(ea_s - ka_s) / 180
-                sym.append(sym_err)
+    avg_score = round(statistics.mean(scores),1) if scores else 0
+    avg_sym = round(statistics.mean(sym),1) if sym else 0
 
-                stroke_idx = int(timestamp / 1200)
-                stroke_bins[stroke_idx].append((ea_s, ka_s, sym_err))
+    results_summary.append((video.name, avg_score, avg_sym))
 
-                if preview and frame_id % 90 == 0:
-                    st.image(frame, channels="BGR", width=300)
-
-            except Exception:
-                continue  # graceful MediaPipe failure recovery
-
-        cap.release()
-
-        strokes = []
-        for k, v in stroke_bins.items():
-            if len(v) < 3:
-                continue
-            e = np.mean([x[0] for x in v])
-            k_ = np.mean([x[1] for x in v])
-            s = np.mean([x[2] for x in v])
-            strokes.append({"elbow": e, "knee": k_, "sym": s})
-
-        base = np.mean(sym) * 100 if sym else 50
-        score = max(0, 100 - base * (1.3 if strict else 1.0))
-
-        pdf_path = generate_pdf(file.name, strokes, score)
-        zip_files.append(pdf_path)
-
-        # Charts
-        fig, ax = plt.subplots()
-        ax.plot(elbows, label="Elbow")
-        ax.plot(knees, label="Knee")
-        ax.legend()
-        st.pyplot(fig)
-
-        results.append((file.name, score))
-
-    # ---------------- COMPARISON ----------------
-    st.header("📊 Coach Comparison View")
-    names = [r[0] for r in results]
-    scores = [r[1] for r in results]
-
+    # ------------------ CHART ------------------
     fig, ax = plt.subplots()
-    ax.bar(names, scores)
-    ax.set_ylabel("Technique Score")
-    st.pyplot(fig)
+    ax.plot(scores, label="Score")
+    ax.plot(sym, label="Symmetry")
+    ax.legend()
+    chart_path = f"{video.name}_chart.png"
+    fig.savefig(chart_path)
+    plt.close(fig)
+    zipf.write(chart_path)
 
-    # ---------------- ZIP ----------------
-    zip_path = tempfile.NamedTemporaryFile(delete=False, suffix=".zip").name
-    with zipfile.ZipFile(zip_path, "w") as z:
-        for f in zip_files:
-            z.write(f, arcname=os.path.basename(f))
+    # ------------------ PDF ------------------
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial","B",14)
+    pdf.cell(0,10,video.name,ln=1)
+    pdf.set_font("Arial","",11)
+    pdf.cell(0,8,f"Average Score: {avg_score}",ln=1)
+    pdf.cell(0,8,f"Average Symmetry: {avg_sym}",ln=1)
+    pdf.image(chart_path,w=170)
 
-    with open(zip_path, "rb") as f:
-        st.download_button(
-            "⬇ Download ALL Results (ZIP)",
-            data=f,
-            file_name="swim_analysis_results.zip",
-            mime="application/zip"
-        )
+    pdf_path = f"{video.name}.pdf"
+    pdf.output(pdf_path)
+    zipf.write(pdf_path)
+
+# ============================================================
+# COACH COMPARISON TABLE
+# ============================================================
+st.subheader("📊 Coach Comparison")
+st.table(
+    [{"Video":v,"Avg Score":s,"Symmetry":y} for v,s,y in results_summary]
+)
+
+zipf.close()
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+with open(zip_path,"rb") as f:
+    st.download_button(
+        "⬇ Download ALL Results (ZIP)",
+        data=f,
+        file_name="swim_analysis_results.zip",
+        mime="application/zip"
+    )
+
