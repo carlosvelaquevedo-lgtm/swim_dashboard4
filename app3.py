@@ -3,11 +3,8 @@
 # 🏊 Freestyle Swimming Technique Analyzer – Streamlit App
 # Cloud-safe • Mobile-safe • Coach-ready
 # ============================================================
-# app.py - Streamlit Web Dashboard for Freestyle Swim Analyzer
-
-# app.py - Streamlit Dashboard: Freestyle Swimming Technique Analyzer
-
-# app.py - Streamlit Dashboard: Freestyle Swimming Technique Analyzer
+# app.py - Streamlit Web App: Freestyle Swimming Technique Analyzer
+# Outputs: Annotated Video, CSV, PDF, and auto-zipped bundle
 
 import streamlit as st
 import cv2
@@ -28,6 +25,7 @@ from reportlab.lib import colors
 import io
 import tempfile
 import urllib.request
+import zipfile
 
 # ────────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -73,26 +71,27 @@ st.set_page_config(page_title="Swim Coach Analyzer", layout="wide")
 
 st.title("Freestyle Swimming Technique Analyzer")
 st.markdown("""
-Upload a side-view freestyle swimming video to get:
-- Annotated video with technique overlays
-- CSV export of time-series data
-- PDF report with summary, key positions & time-series plot
+**Upload a side-view freestyle swimming video** to receive:
+- Annotated video with real-time technique overlays
+- Full time-series data (CSV)
+- Detailed PDF report with key positions & time-series plot
+- One-click ZIP download of **everything**
 """)
 
-# Sidebar settings
+# Sidebar
 with st.sidebar:
-    st.header("Analysis Settings")
+    st.header("Settings")
     is_underwater = st.checkbox("Underwater footage", value=False)
-    st.caption("Adjust if video is underwater (affects ideal angle ranges)")
+    st.caption("Changes ideal joint angle ranges")
 
 uploaded_file = st.file_uploader("Upload video (.mp4 recommended)", type=["mp4", "mov", "avi"])
 
 if uploaded_file is not None:
-    st.success(f"Video ready: {uploaded_file.name} ({uploaded_file.size / 1024 / 1024:.1f} MB)")
+    st.success(f"Video uploaded: {uploaded_file.name} ({uploaded_file.size / (1024*1024):.1f} MB)")
 
-    if st.button("Start Analysis", type="primary"):
-        with st.spinner("Processing video... (may take 1–5+ minutes depending on length)"):
-            # Temporary file handling
+    if st.button("Analyze Video", type="primary"):
+        with st.spinner("Processing video... (may take several minutes)"):
+            # Temporary input file
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
                 tmp_in.write(uploaded_file.read())
                 input_path = tmp_in.name
@@ -114,11 +113,10 @@ if uploaded_file is not None:
                 IDEAL_ROLL_ABS_MAX = 55.0
 
                 # ────────────────────────────────────────────────
-                # MODEL DOWNLOAD & SETUP
+                # MODEL SETUP
                 # ────────────────────────────────────────────────
                 MODEL = "pose_landmarker_heavy.task"
                 if not os.path.exists(MODEL):
-                    st.info("Downloading MediaPipe model (one-time)...")
                     urllib.request.urlretrieve(
                         "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
                         MODEL
@@ -140,7 +138,7 @@ if uploaded_file is not None:
                 # ────────────────────────────────────────────────
                 cap = cv2.VideoCapture(input_path)
                 if not cap.isOpened():
-                    raise RuntimeError("Cannot open uploaded video")
+                    raise RuntimeError("Cannot open video")
 
                 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
@@ -150,7 +148,6 @@ if uploaded_file is not None:
                 annotated_path = f"annotated_{timestamp}.mp4"
                 writer = cv2.VideoWriter(annotated_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
-                # Data storage
                 times = []
                 elbow_vals = []
                 kl_vals = []
@@ -177,10 +174,8 @@ if uploaded_file is not None:
 
                 best_elbow_dev = float('inf')
                 worst_elbow_dev = -float('inf')
-                best_frame_bytes = None
-                worst_frame_bytes = None
-                best_time = None
-                worst_time = None
+                best_frame_bytes = worst_frame_bytes = None
+                best_time = worst_time = None
 
                 frame_id = 0
 
@@ -193,11 +188,10 @@ if uploaded_file is not None:
 
                 while cap.isOpened():
                     ret, frame = cap.read()
-                    if not ret:
-                        break
+                    if not ret: break
 
                     frame_id += 1
-                    progress_bar.progress(min(frame_id / 500, 1.0))  # rough estimate
+                    progress_bar.progress(min(frame_id / 500, 1.0))  # rough
 
                     orig_frame = frame.copy()
                     h, w = frame.shape[:2]
@@ -289,10 +283,8 @@ if uploaded_file is not None:
                         current_side = desired_side
                     if current_side in ('L', 'R') and side_persist_counter >= MIN_BREATH_HOLD_FRAMES:
                         if t_s - last_breath_time >= MIN_BREATH_GAP_S:
-                            if current_side == 'L':
-                                breath_count_L += 1
-                            else:
-                                breath_count_R += 1
+                            if current_side == 'L': breath_count_L += 1
+                            else: breath_count_R += 1
                             last_breath_time = t_s
                     breath_state_series.append(current_side)
 
@@ -323,13 +315,13 @@ if uploaded_file is not None:
                 writer.release()
 
                 # ────────────────────────────────────────────────
-                # SUMMARY & OUTPUTS
+                # SUMMARY CALCULATIONS
                 # ────────────────────────────────────────────────
                 session_duration_s = times[-1] if times else 0.0
-                avg_score   = statistics.mean(scores) if scores else 0.0
-                avg_sym     = statistics.mean(sym_vals) if sym_vals else 0.0
-                avg_roll    = statistics.mean(roll_angles) if roll_angles else 0.0
-                max_roll_abs = max(abs(r) for r in roll_angles) if roll_angles else 0.0
+                avg_score = statistics.mean(scores) if scores else 0.0
+                avg_sym = statistics.mean(sym_vals) if sym_vals else 0.0
+                avg_roll = statistics.mean(roll_angles) if roll_angles else 0.0
+                max_roll_abs = max([abs(r) for r in roll_angles]) if roll_angles else 0.0
 
                 sr_single_avg = sr_both_avg = 0.0
                 if len(stroke_times) >= 2:
@@ -340,7 +332,9 @@ if uploaded_file is not None:
                 total_min = session_duration_s / 60.0 if session_duration_s > 0 else 1e-6
                 bpm_avg = (breath_count_L + breath_count_R) / total_min if total_min > 0.01 else 0.0
 
+                # ────────────────────────────────────────────────
                 # CSV
+                # ────────────────────────────────────────────────
                 df = pd.DataFrame({
                     "time_s": times,
                     "elbow_deg": elbow_vals,
@@ -356,25 +350,39 @@ if uploaded_file is not None:
                 df.to_csv(csv_buffer, index=False, float_format="%.2f")
                 csv_buffer.seek(0)
 
-                # Plot (simplified example - expand as needed)
+                # ────────────────────────────────────────────────
+                # PLOT (simple version - extend as needed)
+                # ────────────────────────────────────────────────
                 fig_buffer = io.BytesIO()
                 if len(times) > 5:
-                    fig, axs = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
-                    axs[0].plot(times, elbow_vals, label="Elbow")
-                    axs[0].legend(); axs[0].grid(True)
-                    axs[1].plot(times, scores, label="Score", color="green")
-                    axs[1].legend(); axs[1].grid(True)
-                    axs[2].plot(times, roll_angles, label="Roll", color="purple")
-                    axs[2].legend(); axs[2].grid(True)
-                    axs[3].plot(times, scores, label="Score")
+                    fig = plt.figure(figsize=(12, 10))
+                    gs = fig.add_gridspec(4, 1, hspace=0.3)
+
+                    ax1 = fig.add_subplot(gs[0, 0])
+                    ax1.plot(times, elbow_vals, label="Elbow (°)")
+                    ax1.legend(); ax1.grid(True)
+
+                    ax2 = fig.add_subplot(gs[1, 0])
+                    ax2.plot(times, scores, label="Score", color="green")
+                    ax2.legend(); ax2.grid(True)
+
+                    ax3 = fig.add_subplot(gs[2, 0])
+                    ax3.plot(times, roll_angles, label="Body Roll (°)", color="purple")
+                    ax3.legend(); ax3.grid(True)
+
+                    ax4 = fig.add_subplot(gs[3, 0])
+                    ax4.plot(times, scores, label="Score")
                     for ts in stroke_times:
-                        axs[3].axvline(ts, color="cyan", ls="--", alpha=0.5)
-                    axs[3].legend(); axs[3].grid(True)
+                        ax4.axvline(ts, color="cyan", ls="--", alpha=0.5)
+                    ax4.legend(); ax4.grid(True)
+
                     plt.savefig(fig_buffer, format="png", dpi=150, bbox_inches="tight")
                     plt.close(fig)
                     fig_buffer.seek(0)
 
-                # PDF
+                # ────────────────────────────────────────────────
+                # PDF REPORT
+                # ────────────────────────────────────────────────
                 pdf_buffer = io.BytesIO()
                 pdf = SimpleDocTemplate(pdf_buffer, pagesize=letter)
                 styles = getSampleStyleSheet()
@@ -386,65 +394,71 @@ if uploaded_file is not None:
                 story.append(Paragraph(f"Video: {uploaded_file.name}", styles["Normal"]))
                 story.append(Paragraph(f"Duration: {session_duration_s:.1f} s", styles["Normal"]))
                 story.append(Paragraph(f"Avg Score: {avg_score:.1f}/100", styles["Normal"]))
-                story.append(Paragraph(f"Avg Roll: {avg_roll:.1f}° (max |roll|: {max_roll_abs:.1f}°)", styles["Normal"]))
+                story.append(Paragraph(f"Avg Body Roll: {avg_roll:.1f}° (max |roll|: {max_roll_abs:.1f}°)", styles["Normal"]))
+                if max_roll_abs > IDEAL_ROLL_ABS_MAX:
+                    story.append(Paragraph("Note: Max roll exceeds typical efficient range.", styles["Italic"]))
                 story.append(Spacer(1,12))
 
-                story.append(Paragraph("Summary", styles["Heading2"]))
-                story.append(Paragraph(f"Avg Stroke Rate: {sr_single_avg:.1f} / {sr_both_avg:.1f} spm", styles["Normal"]))
-                story.append(Paragraph(f"Breaths/min: {bpm_avg:.1f}", styles["Normal"]))
+                story.append(Paragraph("Stroke & Breathing Summary", styles["Heading2"]))
+                story.append(Paragraph(f"Avg Stroke Rate: {sr_single_avg:.1f} (single) / {sr_both_avg:.1f} (both) spm", styles["Normal"]))
+                story.append(Paragraph(f"Breaths/min: {bpm_avg:.1f} (L:{breath_count_L} R:{breath_count_R})", styles["Normal"]))
                 story.append(Spacer(1,18))
 
-                story.append(Paragraph("Time-Series Plot", styles["Heading2"]))
+                story.append(Paragraph("Time-Series Analysis", styles["Heading2"]))
                 if fig_buffer.getvalue():
                     img_plot = RLImage(fig_buffer)
                     img_plot.drawWidth = letter[0] - 72
                     img_plot.drawHeight = (letter[0] - 72) * 0.65
                     story.append(img_plot)
                 else:
-                    story.append(Paragraph("No plot generated", styles["Italic"]))
+                    story.append(Paragraph("No plot generated (insufficient data)", styles["Italic"]))
 
                 pdf.build(story)
                 pdf_buffer.seek(0)
 
                 # ────────────────────────────────────────────────
-                # DISPLAY RESULTS
+                # ZIP ALL FILES
                 # ────────────────────────────────────────────────
-                st.success("Analysis complete!")
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+                    with open(annotated_path, "rb") as f:
+                        zipf.writestr("annotated_swim.mp4", f.read())
+                    zipf.writestr("swim_analysis.csv", csv_buffer.getvalue())
+                    zipf.writestr("swim_report.pdf", pdf_buffer.getvalue())
+                    if fig_buffer.getvalue():
+                        zipf.writestr("timeseries_plot.png", fig_buffer.getvalue())
+
+                zip_buffer.seek(0)
+
+                # ────────────────────────────────────────────────
+                # RESULTS UI
+                # ────────────────────────────────────────────────
+                st.success("Analysis complete! Download your results below.")
 
                 st.video(annotated_path)
 
-                col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns([3, 1])
+
                 with col1:
-                    with open(annotated_path, "rb") as f:
-                        st.download_button(
-                            label="Download Annotated Video",
-                            data=f,
-                            file_name="annotated_swim.mp4",
-                            mime="video/mp4"
-                        )
+                    st.download_button(
+                        label="Download All Files (ZIP)",
+                        data=zip_buffer,
+                        file_name=f"swim_analysis_{timestamp}.zip",
+                        mime="application/zip",
+                        help="Contains: annotated video, CSV data, PDF report, time-series plot"
+                    )
+
                 with col2:
-                    st.download_button(
-                        label="Download CSV",
-                        data=csv_buffer,
-                        file_name="swim_analysis.csv",
-                        mime="text/csv"
-                    )
-                with col3:
-                    st.download_button(
-                        label="Download PDF Report",
-                        data=pdf_buffer,
-                        file_name="swim_report.pdf",
-                        mime="application/pdf"
-                    )
+                    if st.button("Clear & Start New"):
+                        st.experimental_rerun()
 
             except Exception as e:
                 st.error(f"Error during processing: {str(e)}")
-                st.exception(e)
             finally:
-                if 'input_path' in locals():
+                if os.path.exists(input_path):
                     os.unlink(input_path)
-                if 'annotated_path' in locals() and os.path.exists(annotated_path):
-                    os.unlink(annotated_path)  # optional: keep if you want to cache
+                if os.path.exists(annotated_path):
+                    os.unlink(annotated_path)
 
 else:
-    st.info("Please upload a video to begin analysis.")
+    st.info("Upload a video to begin analysis.")
